@@ -1,0 +1,253 @@
+#!/bin/bash
+
+#
+# pvs2influx - retrieve data from pvs6 and store into an Influx bucket
+#
+#
+
+SCRIPTNAME="pvs2influx"
+PVSCRIPTVER=0.3
+
+source "/home/admin/pvs6/port/pvs6.inc"
+
+loglevel=$INFO
+
+#
+# keepdbupdated - called by checktod when it is after sunset and before sunrise
+#
+#                 simply loads the database bucket with the last measured results
+#
+
+keepdbupdated() {
+
+	dlog $INFO "Keeping database updated overnight"
+
+	if [ ! -z $PVSDATA ]; then
+		write2influx "$INFLUX_BUCKET" "$PVSDATA"
+	fi
+}
+
+#
+# checktod - check time is between sunrise and sunset
+#          only called when AUTO is set to ON
+#          will exit the script if too dark for useful solar data
+
+checktod() {
+	curl -X GET -s -o $DATADIR/sun2.json "https://api.sunrise-sunset.org/json?lat='$latitude'&lng='$latitude'&tzid='$timezone'"
+	sunrise=$(cat $DATADIR/sun2.json | jq -r '.results.civil_twilight_begin' | tr -d ',')
+	sunset=$(cat $DATADIR/sun2.json | jq -r '.results.civil_twilight_end' | tr -d ',')
+	nowepoch=$(date +%s)
+printf "Sunrise: %s   Sunset %s now: %s\\n" $sunrise $sunset $nowepoch > sun
+	sunriseepoch=$(date -d "$sunrise" +%s)
+	sunsetepoch=$(date -d "$sunset" +%s)
+	# Get current DST status (1 if DST is in effect, 0 if not)
+	dst=$(date +%Z | grep -q 'DT' && echo 1 || echo 0)
+
+	# Adjust variable based on DST
+	if [ "$dst" -eq 1 ]; then
+    		offset=3600
+	else
+		offset=0
+	fi
+	# Apply offset to sunrise and sunset times
+	sunriseepoch=$((sunriseepoch + offset))
+	sunsetepoch=$((sunsetepoch + offset))
+
+
+	printf -v dstring  "Sunrise %s  Sunset %s  Now %s" "$sunriseepoch" "$sunsetepoch" "$nowepoch"
+	dlog $INFO $dstring
+printf "$dstring" >> sun
+
+
+	if [ "$nowepoch" -lt "$sunriseepoch" ] || [ "$nowepoch" -gt "$sunsetepoch" ]; then
+		nowis=$(date +%M)
+		if [ "$nowis" -eq "00" ] || [ "$nowis" -eq "30" ]; then
+			return
+		fi
+		if [ $KEEPDBFILLED = $ON ]; then
+			keepdbupdated
+		fi
+		exit
+	fi
+
+}
+
+checkpvs() {
+	if ! ping -q -c 2 -W 2 $pvslocal >/dev/null; then
+		logger -t "pvs6" "PVS6 device not responding"
+		printf "\\n PVS6 %s not responding on %s\\n\\n" $pvslocal "$today"  > $MAILTXT
+		$MAILER "PVS6 Unresponsive"
+		echo "PVS6 in error" > $DATADIR/inerror
+		printf -v dstring "PVS6 %s not responding" $pvslocal
+		dlog $ERROR "$dstring"
+		exit
+	fi
+}
+
+write2influx() {
+
+	# Set InfluxDB connection details based on args
+	INFLUX_BUCKET="$1"
+	INFLUX_FILE="$2"
+
+# Send the data to InfluxDB
+	curl -X POST \
+  	-H "Authorization: Token $INFLUX_TOKEN" \
+  	-H "Content-Type: text/plain; charset=utf-8" \
+  	"$INFLUX_URL/api/v2/write?org=$INFLUX_ORG&bucket=$INFLUX_BUCKET&precision=ns" \
+ 	--data-binary @$INFLUX_FILE
+}
+
+processpvs() {
+
+	# Process each field/tag in PVS 
+
+#
+# backup PVSDATA before clearing
+
+	if [ -f $PVSDATA ]; then
+		cp $PVSDATA $PVSDATA.prev
+		cat /dev/null > $PVSDATA
+	fi
+	
+	while IFS= read -r i; do
+		# Build jq expressions with properly quoted variables
+	        stfield=".devices[] | select(.DEVICE_TYPE == \"PVS\") | .STATE"
+	        state=$(jq "$stfield" $PVSRAW)
+		stfield=".devices[] | select(.DEVICE_TYPE == \"PVS\") | .${i}"
+	        field=$(jq "$stfield" $PVSRAW)
+	        # Output the result to $PVSDATA
+		case $i in
+			[A-Z]*)
+	        		printf "pvs,tag=$i $i=$field\\n" >> $PVSDATA
+		;;
+	
+	        	*)
+				printf "pvs $i=$field\\n" | tr -d '"' >> $PVSDATA
+		;;
+		esac
+	done < $DATADIR/pvstags
+	
+	# Process each field/tag in Power Meter
+	
+	while IFS= read -r i; do
+	        # Build jq expressions with properly quoted variables
+	        stfield=".devices[] | select(.TYPE == \"PVS5-METER-P\") | .STATE"
+	        state=$(jq "$stfield" $PVSRAW)
+		stfield=".devices[] | select(.TYPE == \"PVS5-METER-P\") | .${i}"
+	        field=$(jq "$stfield" $PVSRAW)
+	
+	        # Output the result to $PVSDATA
+		case $i in
+			[A-Z]*)
+	        		printf "PowerMeter,tag=$i $i=$field\\n" >> $PVSDATA
+		;;
+	
+	        	*)
+				printf "PowerMeter $i=$field\\n" | tr -d '"' >> $PVSDATA
+		;;
+		esac
+	done < $DATADIR/pmtags
+	
+	# Extract panel serial numbers and store them
+	stfield=".devices[] | select(.DEVICE_TYPE == \"Inverter\") | .SERIAL"
+	jq "$stfield" $PVSRAW | tr -d '"' > $DATADIR/panelsn
+
+	pnltsum=0
+	pcount=0
+
+	
+	# Process each serial number and tag
+	while IFS= read -r i; do
+	        # Build jq expressions with properly quoted variables
+		# see if panel is active
+	
+	        stfield=".devices[] | select((.DEVICE_TYPE == \"Inverter\") and .SERIAL == \"$i\") | .STATE"
+	        state=$(jq "$stfield" $PVSRAW | tr -d '"')
+		if [ "$state" == "working" ]; then
+	    		while IFS= read -r j; do
+	        		sfield=".devices[] | select((.DEVICE_TYPE == \"Inverter\") and .SERIAL == \"$i\") | .${j}"
+	        		field=$(jq "$sfield" $PVSRAW)
+	
+	        # Output the result to $PVSDATA
+
+				case $j in
+					[A-Z]*)
+	        				printf "inverter,tag=$i $j=$field\\n" >> $PVSDATA
+					;;
+	        			*)
+						printf "inverter,tag=$i $j=$field\\n" | tr -d '"' >> $PVSDATA
+					;;
+				esac
+	    		done < $DATADIR/invtags
+#
+# only get and average panel temperature for working panels
+#
+			pcount=$((pcount + 1))
+			ptemp=".devices[] | select((.DEVICE_TYPE == \"Inverter\") and .SERIAL == \"$i\") | .t_htsnk_degc"
+			pnltmp=$(jq "$ptemp" $PVSRAW | tr -d '"')
+			printf "inverter,tag=$i pnltmpc=$pnltmp\\n" >> $PVSDATA
+			pnltsum=$((pnltsum + pnltmp))
+		fi
+	done < $DATADIR/panelsn
+	panelavgtmp=$((pnltsum / pcount))
+	panelavgF=$(echo "1.8 * $panelavgtmp + 32" | bc -l)
+	printf "inverter,tag=pnltmpc averagepaneltemp=$panelavgtmp\\n" >> $PVSDATA
+	printf "inverter,tag=pnltmpf averagepaneltempF=$panelavgF\\n" >> $PVSDATA
+}
+
+
+# main
+
+# if Auto is enabled, check sunrise and sunset
+
+if [ "$AUTOLIGHT" -eq "$ON" ]; then
+	checktod
+fi
+
+
+# Make sure rPi proxy is on-line
+
+dlog $INFO "Calling Check Proxy"
+
+checkproxy
+
+# Make sure PVS6 is on line
+
+# Warning, not always reliable...pvs6 sometimes leaves the lan
+#dlog $INFO "Calling Check PVS6"
+
+#checkpvs
+
+# if were here, we know the time of day is good and systems are on-line
+
+# get data from PVS6
+
+dlog $INFO "Getting data from PVS6"
+
+getpvsdata $PVSRAW
+
+# process data for DB
+
+dlog $INFO "Processing data"
+
+processpvs
+
+# Send the data to InfluxDB
+
+dlog $INFO "Writing to database"
+
+if [ ! -z $PVSDATA ]; then
+	write2influx "$INFLUX_BUCKET" "$PVSDATA"
+else
+	logger -t "pvs6" "PVSdata file 0"
+	if [ "$sndemail" -eq $ON ]; then
+		printf "\\n PVSdata file  %s is 0 length \\n\\n" "$PVSDATA"  > $MAILTXT
+		$MAILER "PVS data file 0 length"
+	fi
+	dlog $ERROR "PVSdata file 0!!!"
+fi
+
+dlog $INFO "done"
+
+
