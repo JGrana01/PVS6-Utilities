@@ -1,0 +1,842 @@
+#!/bin/bash
+
+#set -x
+
+#
+# pvs6mon - make sure the PVS6 is working and all solar panels are operating
+#
+# Should be run mid-day to make sure each one is generating power
+#
+# commands are:
+#
+#       init - initialize a baseline. Read through pvs6 output and store the number of panels
+#              with their serial number.
+#              Should only be run once.
+#
+#       check - go through pvs6 output and make sure every panel is operational
+#               if not, optionally send an email with the panel(s) not operating
+#               Also log the results in panelerror
+#
+#
+
+source "/home/admin/pvs6/port/pvs6.inc"
+
+#PVSRAW="/home/admin/pvs6/port/data/pvsout2.json"
+
+PANELSLOG="$REPORTSDIR/panelslog.txt"
+REPORT="$REPORTSDIR/pvs6report_$dateis.txt"
+PNLP="$DATADIR/panelspower.txt"
+PANELSPWRCSV="$REPORTSDIR/panelspower.csv"
+PANELSMINMAX="$REPORTSDIR/panelsminmax.csv"
+PANELSN="$DATADIR/panelsn"
+PANELSNTMP="$DATADIR/panelsn.tmp"
+PANELCNT="$DATADIR/panelcnt"
+PANELCNTTMP="$DATADIR/panelcnt.tmp"
+PVSINFO="$DATADIR/pvsinfo"
+NETPWR="$DATADIR/netpwr"
+CHECKPANELSCFG="$DATADIR/checkpvs.cfg"
+POWERTHRESHOLD="0.3"
+
+
+SCRIPTNAME="pvs6mon"
+
+SMSCRIPTVER="0.3"
+
+checktod() {
+
+	nowis=$(date +%H)
+
+	if [ $nowis -lt $STARTHOUR ] || [ $nowis -gt $ENDHOUR ]; then
+		printf "\\n$SCRIPTNAME: Warning running script outside of recommended hours of %s and %s\\n" $STARTHOUR $ENDHOUR
+		printf "\\n Results could be inaccurate... \\n\\n"
+	fi
+}
+
+#
+# check both the rpi proxy and pvs6 (via proxy). If either fails, exit
+#
+
+checkservers() {
+
+	checkproxy 	# make sure rPi proxy is online - if not, bail
+	if ! $(checkpvs); then
+		logger -t "$SCRIPTNAME" "PVS6 not responding to http request - offline?"
+		printf "PVS6 via proxy not responding to http request - offline?\\n"
+		exit
+	fi
+}
+
+checkfiles() {
+
+# check if the PVSRAW file is available and not too old (or 0 - probably pvs6.sh getting the data)
+
+	if ! [ -f $PVSRAW ] || [ $(($(date +%s) - $(stat -c%Y $PVSRAW))) -gt 3600 ] || ! [ -s $PVSRAW ]; then
+		# attempt to get the data ourselves. 
+		checkproxy
+		printf -v dstring "PVSRAW too old, attempting to get another\\n"
+		dlog $INFO "$dstring"
+		rprint $ON "$dstring"
+		getpvsdata $PVSRAW
+	fi
+
+# now make sure it's reasonable
+
+	if ! [ -s $PVSRAW ]; then
+		logger -t "$SCRIPTNAME" "$PVSRAW file is empty!!!"
+		printf "%s file is empty (0 length)!!! Is pvs6.sh running?\\n" $PVSRAW
+		printf "%s %s file is zero length!!! Is pvs6.sh installed and running?\\n" "$today" $PVSRAW > $MAILTXT
+		$MAILER "Checkpanels empty pvsraw file!!!"
+		printf -v dstring "Checkpanels empty pvsraw file!!!"
+		dlog $ERROR "$dstring"
+		rprint $ON "$dstring"
+		exit
+	fi
+
+# init/clear reports files etc
+
+	printf "\\n           pvs6mon Report  %s\\n" "$today" > $REPORT
+
+}
+
+# prunereports - remove text files older than 7 days old
+
+prunereports() {
+
+	if [ -d $REPORTSDIR ]; then
+		find "$REPORTSDIR" -iname "*.txt"  -mtime +7 -exec rm -f {} \;
+	fi
+}
+
+		
+initpanels() {
+
+# Extract panel serial numbers and store them
+
+	stfield=".devices[] | select(.DEVICE_TYPE == \"Inverter\") | .SERIAL"
+	jq "$stfield" $PVSRAW | tr -d '"' > $PANELSN
+	cat $PANELSN | wc -l > $PANELCNT
+	cat /dev/null > $PANELSLOG
+	pcount=$(cat $PANELCNT)
+	printf "SN,Periods Power\\n" > $PNLP
+	if [ ! -f $REPORTSDIR/panels.csv ]; then
+		printf "SN,State,Power,Temp" > $REPORTSDIR/panels.csv
+	fi
+	printf "Files created and Panels and SN stored. Found %d panels\\n" $pcount
+	dlog $INFO "Files created and Panels and SN stored."
+}
+
+updatesn() {
+
+	stfield=".devices[] | select(.DEVICE_TYPE == \"Inverter\") | .SERIAL"
+	jq "$stfield" $PVSRAW | tr -d '"' > $PANELSN.tmp
+}
+
+checkpvsfw() {
+
+	pvsfws=$(getvalue "DEVICE_TYPE" "PVS" "SWVER")
+	pvsfw=$(echo "$pvsfws" | awk '{print $1}' | tr -d ',')
+	pvsfwbuild=$(echo "$pvsfws" | awk '{print $3}')
+	pvsmeterpfw=$(getvalue "TYPE" "PVS5-METER-P" "SWVER" | tr -d ',')
+	pvsmetercfw=$(getvalue "TYPE" "PVS5-METER-C" "SWVER" | tr -d ',')
+	getvalue "DEVICE_TYPE" "Inverter" "SWVER" | tr -d ',' | tr ' ' '\n'  > $DATADIR/invertfws
+	printf -v dstring "PVS6 Supervisor FW is %s build: %s" "$pvsfw" "$pvsfwbuild"
+	dlog $INFO "$dstring"
+	printf "$dstring" > $DATADIR/fwstate
+
+	printf -v dstring "  Unchanged\\n"
+
+	if [ -f $DATADIR/pvsfw ]; then
+		source $DATADIR/pvsfw
+		if [ $pvsfw !=  $savedpvsfw ]; then
+			printf -v dstring " !!! PVS6 Supervisor firmware has changed. Previous: %s  New: %s\\n" $savedpvsfw $pvsfw
+			dlog $ERROR "$dstring"
+                        printf -v dstring "             Last Changed %s" "$today" > $DATADIR/pvsfwchgdate
+		fi
+		if [ $pvsfwbuild !=  $savedpvsbuild ]; then
+			printf -v dstring2 "  !!! PVS6 Supervisor firmware build has changed. Previous: %s  New: %s\\n" $savedpvsbuild $pvsfwbuild
+			dlog $ERROR "$dstring2"
+		fi
+		printf -v dstring3 "               Unchanged\\n"
+		if [ $pvsmeterpfw !=  $savedpvspfw ]; then
+			printf -v dstring3 " !!! PVS6 Meter-P firmware has changed. Previous: %s  New: %s\\n" $savedpvspfw $pvsmeterpfw
+			dlog $ERROR "$dstring3"
+                        printf -v dstring3 "            Last Changed %s" "$today" > $DATADIR/pvsmeterpchgdate
+		fi
+		printf -v dstring4 "               Unchanged\\n"
+		if [ $pvsmetercfw !=  $savedpvscfw ]; then
+			printf -v dstring4 " !!! PVS6 Meter-C firmware has changed. Previous: %s  New: %s\\n" $savedpvscfw $pvsmetercfw
+			dlog $ERROR "$dstring4"
+                        printf -v dstring4 "            Last Changed %s" "$today" > $DATADIR/pvsmetecpchgdate
+		fi
+	else
+		printf -v dstring "  No previous FW version file. New one created\\n"
+	fi
+
+	# update previous
+
+	printf "savedpvsfw=%s\\n" $pvsfw > $DATADIR/pvsfw
+	printf "savedpvsbuild=%s\\n" $pvsfwbuild >> $DATADIR/pvsfw
+	printf "savedpvspfw=%s\\n" $pvsmeterpfw >> $DATADIR/pvsfw
+	printf "savedpvscfw=%s\\n" $pvsmetercfw >> $DATADIR/pvsfw
+	cp $DATADIR/invertfws $DATADIR/savedinvertfws
+
+	dlog $INFO "$dstring"
+	printf "$dstring" >> $DATADIR/fwstate
+	printf "$dstring2" >> $DATADIR/fwstate
+	printf "PVS Meter P Firmware: %s  " $pvsmeterpfw >> $DATADIR/fwstate
+	printf "$dstring3" >> $DATADIR/fwstate
+	printf "PVS Meter C Firmware: %s  " $pvsmetercfw >> $DATADIR/fwstate
+	printf "$dstring4" >> $DATADIR/fwstate
+
+}
+
+checkpanelsdata() {
+
+	printf -v dstring "\\nPanels Power  Average: %sW Low Threshold: %sW\\n" $3 $1
+	dlog $INFO "$dstring"
+
+	printf "Panel(s) Below Low Threshold (%sW):\\n" $1 > $DATADIR/panelslow
+
+	panelmax=0
+	panelmin=0
+	panelavgtmp=0
+	panelavgpwr=0
+	lowpanel=0
+
+# get total panels cumulitive power
+
+	tpwr=".devices[] | select((.TYPE == \"PVS5-METER-P\") and .subtype == \"GROSS_PRODUCTION_SITE\") | .net_ltea_3phsum_kwh"
+	totalpwr=$(jq "$tpwr" $PVSRAW | tr -d '"')
+
+	panelmin=$(head -1 $2 | awk -F ',' '{print $2}')	# prime the min number
+	while IFS= read -r i; do
+		pnlsn=$(echo $i | awk -F ',' '{print $1}')
+		pnlspw=$(echo $i | awk -F ',' '{print $2}')
+		pnlstemp=$(echo $i | awk -F ',' '{print $3}')
+		if [[ $(echo "$pnlspw > $panelmax" | bc -l) -eq 1 ]]; then
+			panelmax=$pnlspw
+			maxpanel=$pnlsn
+		elif [[ $(echo "$pnlspw < $panelmin" | bc -l) -eq 1 ]]; then
+			panelmin=$pnlspw
+			minpanel=$pnlsn
+		fi
+		panelavgtmp=$((panelavgtmp + pnlstemp))	
+
+		printf -v dstring "pnlsn %s  pnlspw %sW  Thresh %sW\\n" $pnlsn $pnlspw $1
+		dlog $INFO "$dstring"
+		if [[ $(echo "$pnlspw < $1" | bc -l) -eq 1 ]]; then
+			powerdelta=$(echo "$1 - $pnlspw" | bc -l)
+			printf "Panel SN: %s  Power: %sW  Difference: -%sW\\n" $pnlsn $pnlspw $powerdelta >> $DATADIR/panelslow
+		fi
+	done < $2
+
+	panelavgtmp=$((panelavgtmp / $4))
+	panelavgF=$(echo "1.8 * $panelavgtmp + 32" | bc -l)
+
+	percentreduce=0.0
+
+	if [ $panelavgtmp -gt 25 ]; then   # calculate temperature reduction factor
+		percentreduce=$(echo "($panelavgtmp - 25) * 0.365" | bc -l)
+	fi
+#	printf "\\nTotal Cumulative Power Generated: %.1f kWh\\n" $totalpwr >> /tmp/pcheck.tmp
+	printf "Max Power Panel (%s): %sW\\nMin Power Panel (%s): %sW  \\n" $maxpanel $panelmax $minpanel $panelmin >> /tmp/pcheck.tmp
+
+	if [ "$PANELSCSV" -eq "$ON" ]; then
+		if [ ! -f $PANELSMINMAX ]; then
+			printf " \\n" > $PANELSMINMAX
+			printf "Min Panel\\n" >> $PANELSMINMAX
+			printf "Max Panel\\n" >> $PANELSMINMAX
+			printf "Average\\n" >> $PANELSMINMAX
+		fi
+		cp $PANELSMINMAX /tmp/pnlmmorig.tmp
+		printf "%s\\n" "$dateis" > /tmp/pnlmm.tmp
+		printf "%s\\n" $minpanel >> /tmp/pnlmm.tmp
+		printf "%s\\n" $maxpanel >> /tmp/pnlmm.tmp
+		printf "%s\\n" $3 >> /tmp/pnlmm.tmp
+		paste -d',' /tmp/pnlmmorig.tmp /tmp/pnlmm.tmp > $PANELSMINMAX
+	fi
+
+	if [[ $(cat $DATADIR/panelslow | wc -l) -gt 2 ]]; then
+#		printf "One or more panels generating power below lower threshold!!! (%sW)\\n" $1 >> /tmp/pcheck.tmp
+		cat $DATADIR/panelslow | sed 's/^/  /' >> /tmp/pcheck.tmp
+		echo >> /tmp/pcheck.tmp
+	else
+		printf "All panels generating above low threshold (%sW)\\n" $1 >> /tmp/pcheck.tmp
+	fi
+	printf "\\nPanels Average Temperature: %sC (%.0fF)\\n  Calculated reduction based on panel temperature: -%.1f%%\\n" $panelavgtmp $panelavgF $percentreduce >> /tmp/pcheck.tmp
+}
+	
+
+getvalue() {
+
+	# Build jq expressions with properly quoted variables
+	stfield=".devices[] | select(."$1" == \"$2\") | .$3"
+	echo $(jq "$stfield" $PVSRAW | tr -d '"')
+}
+
+
+dotest() {
+	pstate=$(getvalue "TYPE" "PVS5-METER-P" "STATE")
+	printf "pstate is %s\\n" $pstate
+	cpuload=$(getvalue "DEVICE_TYPE" "PVS" "dl_cpu_load")
+	printf "cpuload is %s\\n" $cpuload
+	
+
+}
+
+#
+# dopvs - get statistic and information about the PVS6
+#
+
+dopvs() {
+
+# get controller information
+
+	printf "\\nPVS6 Controller and Meters Information\\n\\n" > $PVSINFO
+
+	pvsstate=$(getvalue DEVICE_TYPE PVS STATE)
+	pvssn=$(getvalue DEVICE_TYPE PVS SERIAL)
+	cpuup=$(getvalue DEVICE_TYPE PVS dl_uptime)
+	cpudhm=$(convert_seconds "$cpuup")
+	cpuload=$(getvalue DEVICE_TYPE PVS dl_cpu_load)
+	memused=$(getvalue DEVICE_TYPE PVS dl_mem_used)
+	errcnt=$(getvalue DEVICE_TYPE PVS dl_err_count)
+
+	printf "\\n   PVS Controller  SN: %s\\n" $pvssn >> $PVSINFO
+	checkpvsfw
+	cat $DATADIR/fwstate | sed 's/^/\t/' >> $PVSINFO
+	printf "\\tState: %s   Uptime: %s secs (%s)   Err Count: %s\\n" $pvsstate $cpuup "$cpudhm" $errcnt >> $PVSINFO
+	printf "\\tCPU Load: %s  Memory Used: %s Kb\\n\\n" $cpuload $memused >> $PVSINFO
+
+# get power meter P information
+
+	ctlstate=$(getvalue TYPE PVS5-METER-P STATE)
+	ctlsn=$(getvalue TYPE PVS5-METER-P SERIAL)
+	ctlfreq=$(getvalue TYPE PVS5-METER-P freq_hz)
+	pfactor=$(getvalue TYPE PVS5-METER-P tot_pf_rto)
+	pavgpwr=$(getvalue TYPE PVS5-METER-P p_3phsum_kw)
+	netpwr=$(getvalue TYPE PVS5-METER-P net_ltea_3phsum_kwh)
+
+	printf "   PVS Power Meter P   SN: %s\\n" $ctlsn >> $PVSINFO
+	printf "\\tState: %s   Frequency: %s   Power Factor: %s\\n" $ctlstate $ctlfreq $pfactor >> $PVSINFO
+	printf "\\tAverage Real Power: %s kW  Net Cumulative Power: %s kWh  Power Factor Ratio: %s\\n\\n" $pavgpwr $netpwr $pfactor >> $PVSINFO
+
+# get power meter C information
+
+
+	pmcstate=$(getvalue TYPE PVS5-METER-C STATE)
+	pmcsn=$(getvalue TYPE PVS5-METER-C SERIAL)
+	pmcfreq=$(getvalue TYPE PVS5-METER-C freq_hz)
+	pmcv1=$(getvalue TYPE PVS5-METER-C v1n_v)
+	pmcv2=$(getvalue TYPE PVS5-METER-C v2n_v)
+	pmcv12=$(getvalue TYPE PVS5-METER-C v12_v)
+
+	printf "   PVS Power Meter C   SN: %s\\n" $pmcsn >> $PVSINFO
+	printf "\\tState: %s   Frequency: %s  Supply Voltage Lead C1: %s  Supply Voltage Lead C2: %s  \\n          Supply Voltage Sum (C1+C2): %s\\n\\n" $pmcstate $pmcfreq $pmcv1 $pmcv2 $pmcv12 >> $PVSINFO
+
+}
+
+
+#
+# uvindex - get the latest UV index based on user supplied Zip Code
+#
+
+uvindex() {
+
+	if [ "$zipcode" = "ZIP" ]; then
+		printf "No zip code supplied, can not get UV index\\n"
+		return
+	fi
+
+	uvindex=$(jq -r '.[0].UV_INDEX' <<< "$(curl -s https://data.epa.gov/efservice/getEnvirofactsUVDAILY/ZIP/$zipcode/JSON)")
+
+
+	if (( $(echo "$uvindex < 3" | bc -l) )); then
+    		printf "$uvindex (Low)" 
+	elif (( $(echo "$uvindex >= 3 && $uvindex < 6" | bc -l) )); then
+    		printf "$uvindex (Moderate)" 
+	elif (( $(echo "$uvindex >= 6 && $uvindex < 8" | bc -l) )); then
+    		printf "$uvindex (High)" 
+	elif (( $(echo "$uvindex >= 8 && $uvindex < 11" | bc -l) )); then
+    		printf "$uvindex (Very High)" 
+	else
+    		printf "$uvindex (Extreme)" 
+	fi
+
+}
+
+#
+# getforecast - get a 2 day forecast and the present temp/humidity based on longitude and latitide settings
+#
+
+getforecast() {
+
+	if [ "$latitude" = "LAT" ]; then
+		printf -v dstring "Unable to get weather info. Latitude and Logitude not set in config file"
+		dlog "$INFO" "$dstring"
+		printf "$dstring"
+		cat /dev/null > $DATADIR/2dayforecast
+		cat /dev/null > $DATADIR/presentweather
+		return
+	fi
+
+	if [ ! -f $DATADIR/weatherobjs ]; then   # get correct forecast link for geographic loaction
+		weatherapi=$(curl -s -o /tmp/weatherl -H 'accept: application/geo+json' https://api.weather.gov/points/${latitude},${longitude})
+		if [ ! -z /tmp/weatherl ]; then
+			gridId=$(cat /tmp/weatherl | grep -w \"gridId\" | awk -F'"' '{print $4}')
+			gridX=$(cat /tmp/weatherl | grep -w \"gridX\" | awk -F'"' '{print $3}' | awk '{print $2}' | tr -d ',')
+			gridY=$(cat /tmp/weatherl | grep -w \"gridY\" | awk -F'"' '{print $3}' | awk '{print $2}' | tr -d ',')
+			gdata=$(cat /tmp/weatherl | grep -w \"forecastGridData\" | awk -F'"' '{print $4}')
+			stationslink=$(cat /tmp/weatherl |  grep -w \"observationStations\" | awk -F'"' '{print $4}')
+
+# now try to get station ID
+
+			stationid=$(curl -s -H 'accept: application/geo+json' ${stationslink} | grep -m1 stationIdentifier | awk -F'"' '{print $4}' | tr -d ',')
+			printf "weatherAPI=%s\\n" "https://api.weather.gov" > $DATADIR/weatherobjs
+			printf "gridId=%s\\ngridX=%s\\ngridY=%s\\nstationId=%s\\n" $gridId $gridX $gridY $stationid >> $DATADIR/weatherobjs
+		else
+			printf "Weather API did not provide data...\\n"
+		fi
+	fi
+
+	source $DATADIR/weatherobjs
+#
+# get 2 day forecast
+#
+	curl -o $DATADIR/forecast -s -H 'accept: application/geo+json' "$weatherAPI/gridpoints/$gridId/$gridX,$gridY/forecast"
+
+	printf "\\n2 Day Weather Forecast\\n\\n" > $DATADIR/2dayforecast
+	jq -r '.properties.periods[] | select(.number == 1) | "\(.name): \(.detailedForecast)"' $DATADIR/forecast >> $DATADIR/2dayforecast
+	echo >> $DATADIR/2dayforecast
+	jq -r '.properties.periods[] | select(.number == 2) | "\(.name): \(.detailedForecast)"' $DATADIR/forecast >> $DATADIR/2dayforecast
+	echo >> $DATADIR/2dayforecast
+	jq -r '.properties.periods[] | select(.number == 3) | "\(.name): \(.detailedForecast)"' $DATADIR/forecast >> $DATADIR/2dayforecast
+	echo >> $DATADIR/2dayforecast
+#
+# and latest temp/humidity/wind
+#
+	curl -s -o $DATADIR/latest -H 'accept: application/geo+json' "$weatherAPI/stations/$stationId/observations/latest"
+	presenttemp=$(jq .properties.temperature.value $DATADIR/latest)
+	presenttempF=$(echo "1.8 * $presenttemp + 32" | bc -l)
+	humidity=$(jq .properties.relativeHumidity.value $DATADIR/latest)
+	wind=$(jq .properties.windSpeed.value $DATADIR/latest)
+	bm=$(jq .properties.barometricPressure.value $DATADIR/latest)
+	bm_inhg=$(printf "%.2f" $(echo "$bm * 0.0002953" | bc -l))
+	sky=$(grep textDescription $DATADIR/latest | awk -F'"' '{print $4}')
+	cheight=$(grep rawMessage $DATADIR/latest | awk '{print $7}')
+	printf "Present Temperature: %.0fC (%.0fF)  Relative Humidity: %.0f%%\\nWind Speed: %.1f MPH  Barometric Pressure: %s inHG  Sky: %s\\n" $presenttemp $presenttempF $humidity $wind $bm_inhg "$sky" > $DATADIR/presentweather
+
+# attempt to get UV Index
+
+	uvi=$(uvindex)
+	printf "UV Index: %s\\n" "$uvi" >> $DATADIR/presentweather
+
+}
+
+
+docheck() {
+
+	panelcnt=0
+	notworking=0
+	nopower=0
+
+# collect some power information from the Power Meter (P)
+
+	netpwr=$(getvalue TYPE PVS5-METER-P net_ltea_3phsum_kwh)
+	pwrnow=$(getvalue TYPE PVS5-METER-P p_3phsum_kw)
+
+# get previous and store latest for later daily calculation
+
+	nettimestamp=$(date +%s)
+
+	if [ -f $NETPWER ]; then
+		oldnet=$(cat $NETPWR | awk '{print $1}')
+		oldtime=$(cat $NETPWR | awk '{print $2}')
+	else
+		oldnet=0
+	fi
+	echo "$netpwr $nettimestamp" > $NETPWR
+        pdiff=$(printf "%.0f" $(echo "$netpwr - $oldnet" | bc -l))
+        tdiff=$(printf "%.0f" $(echo "$nettimestamp - $oldtime" | bc -l))
+	periodtime=$(convert_seconds "$tdiff")
+	printf -v dstring "   Previous Cumulative Net Power: %0.1fkWh   Cumulative Net Power (now): %0.1fkWh\\n         Difference: %0.1fkWh (Period: %s)\\n" $oldnet $netpwr $pdiff "$periodtime"
+	dlog $INFO "$dstring"
+	rprint $ON "$dstring"
+
+# calculate days total
+
+	daypwr=$(echo "$netpwr - $oldnet" | bc)
+	daykwh=$daypwr
+	daypwr=$(echo "$daypwr * 1000.0" | bc)
+	pwrnow=$(echo "$pwrnow * 1000.0" | bc)
+
+
+	printf -v dstring "   Presently Generating: %.1fW    Since Last Reading: %.1fWh\\n" $pwrnow $daypwr
+	dlog $INFO "$dstring"
+	rprint $ON "$dstring"
+
+	pcount=$(cat $PANELCNT)
+
+# scan panels and see if any are missing
+
+	stfield=".devices[] | select(.DEVICE_TYPE == \"Inverter\") | .SERIAL"
+	jq "$stfield" $PVSRAW | tr -d '"' > $PANELSNTMP
+	cat $PANELSNTMP | wc -l > $PANELCNTTMP
+	pcnt=$(cat $PANELCNTTMP)
+
+
+# check count - report any by SN from initial list
+
+	if [ $pcnt -ne  $pcount ]; then   # a panel has gone missing or another panel is active
+		if [ $pcnt -gt $pcount ] ; then
+			logger -t "$SCRIPTNAME" "One or more panels discovered reporting since initial count"
+			updatesn $PANELSTMP $pcnt			# update the list of reported panels
+			comm --nocheck-order -3 $PANELSN $PANELSNTMP > $DATADIR/missingpanel
+			printf -v rprt "%s  Number of panels differ was %d is now %d\\n" "$today" $pcnt $pcount
+			printf "$rprt" >> $PANELSLOG.new
+			dlog $ERROR "$rprt"
+			rprint $ON "$rprt"
+			printf "%s  New panel(s):  " >> $PANELSLOG.new
+			cat $missingpanel >> $PANELSLOG.new
+			if [ $sndemail = 1 ]; then
+				printf "%s  Number of panels differ was %d is now %d\\n" "$today" $pcnt $pcount >> /tmp/mailtxt
+				printf "%s  New panel(s):  " "$today" >> /tmp/mailtxt
+				cat $DATADIR/missingpanel >> /tmp/mailtxt
+				printf "\\nPanel SN list and count updated.\\n\\n" >> /tmp/mailtxt
+				$MAILER "$SCRIPTNAME - Sunpower Panels - Wrong Number of panels!!!"
+			fi
+		else	# must be less
+			logger -t "$SCRIPTNAME" "One or more panels missing since initial count"
+			updatesn $PANELSTMP $pcnt			# update the list of reported panels
+			comm --nocheck-order -1 $PANELSN $PANELSNTMP > $DATADIR/missingpanel
+			printf -v rprt "%s  Number of panels differ was %d is now %d\\n" "$today" $pcnt $pcount
+			printf "$rprt" >> $PANELSLOG.new
+			dlog $ERROR "$rprt"
+			rprint $ON "$rprt"
+			printf "%s  Missing panel(s):  " >> $PANELSLOG.new
+			cat $missingpanel >> $PANELSLOG.new
+			if [ $sndemail = 1 ]; then
+				printf "%s  Number of panels differ was %d is now %d\\n" "$today" $pcnt $pcount >> /tmp/mailtxt
+				printf "%s  Missing panel(s):  " "$today" >> /tmp/mailtxt
+				cat $DATADIR/missingpanel >> /tmp/mailtxt
+				printf "\\nPanel SN list and count updated.\\n\\n" >> /tmp/mailtxt
+				$MAILER "$SCRIPTNAME - Sunpower Panels - Wrong Number of panels!!!"
+			fi
+
+# update serial number list since one (or more) are missing or a new one showed up
+
+		cat $PANELSNTMP > $PANELSN
+
+		fi
+	fi
+
+# clear out temp files/logs
+
+	cat /dev/null > $PANELSLOG.new
+	cat /dev/null > $DATADIR/panels.tmp
+	cat /dev/null > $PANELSLOG.new
+	cat /dev/null > $DATADIR/panelspower.tmp
+
+	ttopanel=0
+		
+# Count and get power info from each serial number panel (thats in working state)
+
+	printf -v dstring "Checking %d Panels\\n" $pcount
+
+	if [ "$PANELSCSV" -eq "$ON" ]; then
+		if [ ! -f $PANELSPWRCSV ]; then
+			printf "Panel SN\\n" > $PANELSPWRCSV
+			cat $PANELSN >> $PANELSPWRCSV
+		fi
+		cp $PANELSPWRCSV /tmp/pnlpwrorig.tmp
+		printf "%s\\n" $dateis > /tmp/pnlpwr.tmp
+
+	fi
+
+	while IFS= read -r i; do
+
+		# Build jq expressions with properly quoted variables
+		# see if panel is active
+		# compound lookup - cant use getvalue..
+
+
+		stfield=".devices[] | select((.DEVICE_TYPE == \"Inverter\") and .SERIAL == \"$i\") | .STATE"
+		state=$(jq "$stfield" $PVSRAW | tr -d '"')
+		pwrfield=".devices[] | select((.DEVICE_TYPE == \"Inverter\") and .SERIAL == \"$i\") | .p_mppt1_kw"
+		Kpwr=$(jq "$pwrfield" $PVSRAW | tr -d '"')
+		pwr=$(printf "%.0f" $(echo "$Kpwr * 1000" | bc -l))
+		ptemp=".devices[] | select((.DEVICE_TYPE == \"Inverter\") and .SERIAL == \"$i\") | .t_htsnk_degc"
+		paneltemp=$(jq "$ptemp" $PVSRAW | tr -d '"')
+
+		printf -v dstring "%s  SN: %s  State: %s  Power: %s\\n" "$today" $i $state $pwr
+		dlog $INFO "$dstring"
+#
+# add power info to csv file if enabled
+#
+		if [ "$PANELSCSV" -eq "$ON" ]; then
+			printf "%s\\n" $pwr >> /tmp/pnlpwr.tmp
+		fi
+
+# check states
+
+		if [ ! -z "$state" ]; then
+			panelcnt=$((panelcnt + 1))		# panel is reported
+			if [ "$state" != "working" ]; then     # panel not in working state
+				printf -v dstring "%s Not Workiing  SN: %s  State: %s Power: %s\\n" "$today" $i $state $pwr >> $PANELSLOG.new    # error - not working
+				rprint "$BOTH" "$dstring"
+				notworking=$((notworking + 1))
+			elif [ $(echo "$pwr > 0" | bc -l) -eq 1 ]; then    # panels working and generating power?
+				ttopanel=$(echo "$ttopanel + $Kpwr" | bc -l)
+				# store for possible check
+				printf "%s,%s,%s\\n" $i $pwr $paneltemp >> $DATADIR/panelspower.tmp
+			else
+				printf -v dstring "%s No Power  SN: %s  State: %s  Power: %s\\n" "$today" $i $state $pwr >> $PANELSLOG.new    # error no power
+				rprint "$BOTH" "$dstring"
+				nopower=$((nopower + 1))
+			fi
+		fi
+	done < $DATADIR/panelsn
+
+	if [ "$PANELSCSV" -eq "$ON" ]; then
+		if [ $(cat /tmp/pnlpwrorig.tmp | wc -l) -ne $(cat /tmp/pnlpwr.tmp | wc -l) ]; then
+			printf "\\nNumber of detected solar panels different from last period!!\\n" > $PANELSPWRCSV
+		else
+			paste -d',' /tmp/pnlpwrorig.tmp /tmp/pnlpwr.tmp > $PANELSPWRCSV
+		fi
+		rm /tmp/pnlpwrorig.tmp
+		rm /tmp/pnlpwr.tmp
+	fi
+
+	averagepanel=$(printf "%.0f" $(echo "$ttopanel * 1000 / $panelcnt" | bc -l))
+	lowpwr=$(printf $(echo "$averagepanel * $POWERTHRESHOLD" | bc -l))
+	lowpwr=$(printf "%.0f" $lowpwr)   # round to 3 decimal places
+	pthresh=$(echo "$POWERTHRESHOLD * 100" | bc -l)
+	printf -v dstring "Number of Active Panels: %s   Average Power Generated per Panel: %sW\\n" $panelcnt $averagepanel
+	dlog $INFO "$dstring"
+	printf "$dstring" > /tmp/pcheck.tmp
+
+# now check for weak panels - panels much lower than a low threshold
+
+	checkpanelsdata $lowpwr $DATADIR/panelspower.tmp $averagepanel $pcount
+	sed 's/^/   /' /tmp/pcheck.tmp >> $REPORT
+
+	if [ $notworking -gt 0 ] || [ $nopower -gt 0 ]; then  # panel either in error or not generating power
+		logger -t "$SCRIPTNAME" "One or more panels in error state"
+		printf -v dstring  "One or more panels in error state - error panel(s):\\n"
+		dlog $INFO "$dstring"
+		rprint "$ON" "$dstring"
+		cat $PANELSLOG.new >> $REPORT
+		if [ $sndemail = 1 ]; then
+			printf "$s    One or more panels in error state or not producing power" $today > /tmp/mailtxt
+			cat $PANELSLOG.new >> /tmp/mailtxt
+			echo >> /tmp/mailtxt
+			cat /tmp/pcheck.tmp >> /tmp/mailtxt
+			$MAILER "$SCRIPTNAME - Sunpower Panels Error Report - Error!!!"
+		fi
+	else				# all good!
+		printf "%s  All %s panels report good\\n\\n" "$today" "$pcount" > /tmp/mailtxt 
+		printf "\\nDays Total Power Generation: %.0f kWh\\n\\n" $daykwh >> /tmp/mailtxt
+		printf "%s,  %.3f\\n" "$today" $daypwr >> $PNLP
+		cat /tmp/pcheck.tmp >> /tmp/mailtxt
+		checkpvsfw
+		cat $DATADIR/fwstate >> /tmp/mailtxt
+		getforecast
+		printf "\\nWeather:\\n\\n" >> /tmp/mailtxt
+		cat $DATADIR/presentweather >> /tmp/mailtxt
+		cat $DATADIR/2dayforecast >> /tmp/mailtxt
+		logger -t "$SCRIPTNAME" "All panels good"
+		if [ $sndemail = 1 ]; then
+			$MAILER "$SCRIPTNAME -  Sunpower Panels Report - All Good"
+		fi
+	fi
+
+	cat $PANELSLOG.new >> $PANELSLOG
+
+}
+
+
+setuppvs6mon() {
+	echo ""
+        echo "$SCRIPTNAME Version $SMSCRIPTVER"
+        echo ""
+
+        echo "This will do the initial setup for $SCRIPTNAME"
+        echo ""
+        echo "This should be run in the same directory where you want the script and its"
+        echo "associated directories and data files."
+	echo ""
+	echo -n "Are you in the directory where you want the script to execute from? (Y/N) "
+	read ans
+	case $ans in
+		Y|y)
+			SETANCHORE=$(pwd)
+		;;
+		N|n)
+			echo "Copy/Move $SCRIPTNAME to the directory you want to run from"
+			echo "and re-run $SCRIPTNAME setup."
+			exit
+		;;
+		*)
+			echo "Either Y or N..."
+			exit
+		;;
+	esac
+
+	echo "The directory $SETANCHORE will be setup."
+	echo ""
+	read a
+#
+# check for and modify pvs6.inc
+#
+
+#
+# create various directories
+#
+	echo "Creating directories"
+	mkdir -p $SETANCHORE/data
+	mkdir -p $SETANCHORE/reports
+	mkdir -p $SETANCHORE/email
+#
+# checking
+
+	echo "Done!"
+
+}
+
+
+# usage - show commands
+
+usage() {
+	echo ""
+        echo "$SCRIPTNAME Version $SMSCRIPTVER"
+        echo ""
+
+        echo " usage: "$SCRIPTNAME" <command> {command}"
+        echo ""
+        echo "  init - initialize number of panels and needed support files"
+        echo "  check - get information on PVS6 and all panels during mid day"
+        echo "  panels - get information on just all solar panels"
+        echo "  pvs - get information on just PVS6"
+        echo "  fw - get and check information on the firmware for all devices"
+        echo "  report {mail} - get information on PVS6 and panels with detail"
+        echo "            if the {mail} option - send the report by email"
+        echo "  log <level> - set log level"
+        echo "         info - show informational messages"
+        echo "         warn - show warnings"
+        echo "         error - show errors"
+        echo "         nolog - no messages"
+        echo ""
+	exit 1
+}
+
+#
+# main program
+#
+
+
+if [ ${#} -eq 0 ]; then
+        usage
+        exit 0
+fi
+
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+
+		setup)
+			setuppvs6mon		# do initial setup - make dirs, get initial panel information, etc.
+			exit
+		;;
+		check)
+			runtype="check"		# check everything (and email)
+			checktod
+			checkservers
+			checkfiles
+			checkpvsfw
+			docheck
+		;;
+		panels)				# just check panels
+			runtype="panels"
+			checkservers
+			checkfiles
+			dopanels
+           	;;
+		pvs)
+			runtype="pvs"		# just check pvs
+			checkservers
+			checkfiles
+	    		dopvs
+			cat $PVSINFO
+           	;;
+		report)
+			runtype="report"	# check everthing verbose
+			if [ "$2" = "mail" ]; then
+				sndemail=$ON	# override email setting in inc file
+				shift
+			fi
+			checktod
+			checkservers
+			checkfiles
+			checkpvsfw
+			dopvs
+			cat $PVSINFO >> $REPORT
+			printf "\\nSolar Panels/Power Information\\n\\n" >> $REPORT
+			docheck
+			checkpvsfw
+			printf "\\nPVS Device Firmware Versions \\n\\n" >> $REPORT
+			cat $DATADIR/fwstate | sed 's/^/    /' >> $REPORT
+			printf "\\n\\nWeather:\\n\\n" >> $REPORT
+			getforecast
+			sed 's/^/   /' $DATADIR/presentweather >> $REPORT
+			sed 's/^/   /' $DATADIR/2dayforecast >> $REPORT
+			cat $REPORT
+			prunereports
+		;;
+		log)
+			case $2 in
+				nolog)
+					loglevel=$NOLOG
+				;;
+				info)	
+					loglevel=$INFO
+				;;
+				warn)	
+					loglevel=$WARN
+				;;
+				error)	
+					loglevel=$ERROR
+				;;
+				*)
+					printf "log needs nolog or info or warn\\n"
+				;;
+			esac
+			shift
+		;;
+		help)
+			usage
+			exit
+		;;
+		init)
+			checkservers
+			checkfiles
+			initpanels
+		;;
+		debug)	# for internal use. If enabled will output a lot...
+			getforecast
+			cat $DATADIR/presentweather
+			cat $DATADIR/2dayforecast
+		;;
+		fw)
+			checkservers
+			checkfiles
+			checkpvsfw
+			cat $DATADIR/fwstate
+		;;
+		*)
+	   		echo "Invalid argument $1"
+	   		exit
+           	;;
+    	esac
+    shift
+done
+
